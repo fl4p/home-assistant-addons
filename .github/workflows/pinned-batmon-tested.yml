@@ -1,0 +1,84 @@
+name: Pinned batmon-ha is tested
+
+# The add-on Home Assistant users install is THIS repo: the batmon-ha submodule pointer
+# is the release lever. batmon-ha's own CI reports on a push to its master, but nothing
+# tied the pointer to a commit that passed -- 2.33 and 2.34 were both pinned by hand.
+# This job reads the pinned commit and requires a successful `Tests` run for exactly that
+# commit, so a release cannot be pinned to untested code.
+#
+# If the run is still going (a push, then an immediate pin bump), it waits for it.
+# A commit with no Tests run at all is a failure, not a pass: push it to batmon-ha master
+# so CI runs, or dispatch that workflow for it, then re-run this.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pinned-batmon-tested:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the pinned batmon-ha commit
+        id: pin
+        run: |
+          sha=$(git ls-tree HEAD batmon-ha | awk '{print $3}')
+          echo "pinned batmon-ha: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Require a successful Tests run for that commit
+        env:
+          SHA: ${{ steps.pin.outputs.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL="https://api.github.com/repos/fl4p/batmon-ha/actions/workflows/tests.yml/runs?head_sha=${SHA}&per_page=20"
+
+          # The installation token is scoped to this repo, so a cross-repo read may 404.
+          # Fall back to an unauthenticated read: batmon-ha is public.
+          fetch() {
+            if [ -n "${TOKEN:-}" ]; then
+              curl -sS --max-time 30 -H "Authorization: Bearer ${TOKEN}" \
+                   -H 'Accept: application/vnd.github+json' "$URL" 2>/dev/null || true
+            else
+              echo '{}'
+            fi
+          }
+          body=$(fetch)
+          if ! jq -e '.workflow_runs' >/dev/null 2>&1 <<<"$body"; then
+            echo "authenticated read unavailable, retrying unauthenticated"
+            body=$(curl -sS --max-time 30 -H 'Accept: application/vnd.github+json' "$URL")
+          fi
+          if ! jq -e '.workflow_runs' >/dev/null 2>&1 <<<"$body"; then
+            echo "::error::could not read the Tests runs for ${SHA}: $(jq -c '.message? // .' <<<"$body" | head -c 300)"
+            exit 1
+          fi
+
+          # Wait for a run that is still going, then require success. 40 x 15 s = 10 min.
+          for attempt in $(seq 1 40); do
+            line=$(jq -r '[.workflow_runs[] | select(.head_sha == env.SHA)] | sort_by(.created_at) | last
+                           | "\(.status) \(.conclusion // "-") \(.html_url)"' <<<"$body")
+            if [ "$line" != "null - " ] && [ -n "$line" ]; then
+              read -r status conclusion url <<<"$line"
+              echo "attempt ${attempt}: status=${status} conclusion=${conclusion} ${url}"
+              case "$status:$conclusion" in
+                completed:success)
+                  echo "::notice::${SHA} passed its Tests run"
+                  exit 0 ;;
+                completed:*)
+                  echo "::error::the pinned batmon-ha commit ${SHA} did not pass its Tests run (conclusion=${conclusion}): ${url}"
+                  exit 1 ;;
+              esac
+            else
+              echo "attempt ${attempt}: no Tests run for ${SHA} yet"
+            fi
+            sleep 15
+            body=$(fetch)
+            jq -e '.workflow_runs' >/dev/null 2>&1 <<<"$body" || body=$(curl -sS --max-time 30 -H 'Accept: application/vnd.github+json' "$URL")
+          done
+
+          echo "::error::no Tests run for the pinned batmon-ha commit ${SHA} after 10 minutes. Push it to batmon-ha master so its CI runs, then re-run this job."
+          exit 1
